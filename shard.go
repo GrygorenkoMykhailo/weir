@@ -6,24 +6,30 @@ import (
 )
 
 type shard struct {
-	mu      sync.Mutex
-	buckets map[uint64]bucket
+	mu      sync.RWMutex
+	buckets map[uint64]*bucket
 }
 
 func (s *shard) allow(key uint64, cost int64, rateNanos int64, Burst int64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	b, ok := s.buckets[key]
-
-	now := time.Now().UnixNano()
+	s.mu.RUnlock()
 
 	if !ok {
-		s.buckets[key] = bucket{tokens: Burst, lastCalled: now}
-		b = s.buckets[key]
+		s.mu.Lock()
+
+		b, ok = s.buckets[key]
+		if !ok {
+			now := time.Now().UnixNano()
+			b = &bucket{
+				tokens:     Burst,
+				lastCalled: now,
+			}
+			s.buckets[key] = b
+		}
+
+		s.mu.Unlock()
 	}
 
-	allowed := b.allow(cost, rateNanos, Burst, now)
-	s.buckets[key] = b
-
-	return allowed
+	return b.allow(cost, rateNanos, Burst, time.Now().UnixNano())
 }

@@ -51,6 +51,7 @@ func TestNewValidation(t *testing.T) {
 			cfg: RateLimiterOptions{
 				Rate:        time.Second,
 				CleanupRate: time.Second,
+				KeyTTL:      time.Second,
 				Burst:       10,
 				Shards:      256,
 			},
@@ -61,30 +62,44 @@ func TestNewValidation(t *testing.T) {
 			cfg: RateLimiterOptions{
 				Rate:        time.Second,
 				CleanupRate: time.Second,
+				KeyTTL:      time.Second,
 				Burst:       0,
 				Shards:      256,
 			},
 			wantErr: ErrInvalidBurst,
 		},
 		{
-			name: "shards not power of two",
+			name: "invalid cleanup rate",
 			cfg: RateLimiterOptions{
 				Rate:        time.Second,
-				CleanupRate: time.Second,
+				CleanupRate: 0,
+				KeyTTL:      time.Second,
 				Burst:       10,
 				Shards:      100,
 			},
-			wantErr: ErrInvalidShards,
+			wantErr: ErrInvalidCleanupRate,
 		},
 		{
-			name: "zero shards",
+			name: "invalid key ttl",
 			cfg: RateLimiterOptions{
 				Rate:        time.Second,
 				CleanupRate: time.Second,
+				KeyTTL:      0,
 				Burst:       10,
-				Shards:      0,
+				Shards:      100,
 			},
-			wantErr: ErrInvalidShards,
+			wantErr: ErrInvalidKeyTTL,
+		},
+		{
+			name: "invalid rate",
+			cfg: RateLimiterOptions{
+				Rate:        0,
+				CleanupRate: time.Second,
+				KeyTTL:      time.Second,
+				Burst:       10,
+				Shards:      100,
+			},
+			wantErr: ErrInvalidRate,
 		},
 	}
 
@@ -102,6 +117,7 @@ func TestLimiter(t *testing.T) {
 	l, err := New(context.Background(), RateLimiterOptions{
 		Rate:        100 * time.Millisecond,
 		CleanupRate: time.Second,
+		KeyTTL:      time.Second,
 		Burst:       5,
 		Shards:      64,
 	})

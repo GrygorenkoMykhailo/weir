@@ -7,8 +7,10 @@ import (
 )
 
 var (
-	ErrInvalidBurst  = errors.New("config.Burst is below or equal 0")
-	ErrInvalidShards = errors.New("config.Shards should be a power of two")
+	ErrInvalidBurst       = errors.New("config.Burst is below or equal 0")
+	ErrInvalidCleanupRate = errors.New("config.CleanupRate should be a power of two")
+	ErrInvalidKeyTTL      = errors.New("config.KeyTTL is below or equal 0")
+	ErrInvalidRate        = errors.New("config.Rate is below or equal 0")
 )
 
 type RateLimiterOptions struct {
@@ -33,8 +35,20 @@ func New(ctx context.Context, config RateLimiterOptions) (*Limiter, error) {
 		return nil, ErrInvalidBurst
 	}
 
+	if config.CleanupRate <= 0 {
+		return nil, ErrInvalidCleanupRate
+	}
+
+	if config.KeyTTL <= 0 {
+		return nil, ErrInvalidKeyTTL
+	}
+
+	if config.Rate <= 0 {
+		return nil, ErrInvalidRate
+	}
+
 	if !isPowerOfTwo(config.Shards) {
-		return nil, ErrInvalidShards
+		config.Shards = toNearestPowerOfTwo(float64(config.Shards))
 	}
 
 	lim := &Limiter{
@@ -44,7 +58,7 @@ func New(ctx context.Context, config RateLimiterOptions) (*Limiter, error) {
 
 	for i := range config.Shards {
 		lim.shards[i] = shard{
-			buckets: make(map[uint64]bucket),
+			buckets: make(map[uint64]*bucket),
 		}
 	}
 

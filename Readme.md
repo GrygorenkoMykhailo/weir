@@ -11,43 +11,41 @@ Unlike standard rate limiters that suffer from mutex contention on multi-core sy
 > **Weir** (noun): A low dam built across a river to regulate the flow of water.
 
 
-## 🧠 Why Weir? (The Engineering Trade-off)
+## 🧠 Why Weir?
 
-Weir is designed for **system stability**, not just raw micro-benchmark speed.
+Most rate limiters (like `x/time/rate`) rely on a **Global Mutex**. This works fine for low traffic but becomes a bottleneck under high concurrency—writes block reads, causing latency spikes during traffic bursts or DDoS attacks.
 
-### The Problem with Standard Limiters
-Standard limiters (like `x/time/rate` wrapped in a map) use a **Global Mutex**.
-* **Happy Path (Reads):** They are fast because RWMutex is optimized for reads.
-* **Highload (Writes/Churn):** When new users arrive (traffic spikes, DDOS, cache rotation), the Global Write Lock **blocks everyone**. Performance degrades significantly.
+Weir solves this using **Sharding + Fine-Grained Locking**:
 
-### The Weir Solution
-Weir uses **Sharding**.
-* We pay a tiny "tax" for hashing and shard selection on every request.
-* **In return, we get 100% predictable latency.**
-* Write heavy loads (DDOS) do not block existing users.
-* Memory allocations are absent when reading and minimum **2x** smaller when writing.
-* Background janitor cleans up expired keys using probabilistic algoritm, ensuring tiniest possible locking times
-regardless of keys amount
+1.  **Sharding:** The key space is divided into thousands of shards (e.g., 1024), effectively spreading lock contention by a factor of 1000.
+2.  **Fine-Grained Locking:** Weir separates the "Map Lock" (finding the user) from the "Bucket Lock" (updating the tokens).
+    * **Reads are non-blocking:** Checking limits uses parallel `RLock`, allowing thousands of concurrent checks.
+    * **Writes are isolated:** Updating a user's token bucket only locks that specific user, not the entire system.
 
 
 ## 🚀 Benchmarks
 
 Running on **AMD Ryzen 7 PRO 5850U (16 logical cores)**.
 
-Weir is **~13x faster** than the standard library (`golang.org/x/time/rate`), **~2x faster** than (`github.com/ulule/limiter`) and **~31x faster** than (`github.com/juju/ratelimit`) under heavy write load (Highload scenario).
+### Scenario 1: DDoS Attack (Write-Heavy)
+*Simulates 1,000,000 distinct keys attacking the system simultaneously. Heavy map churn and locking.*
 
-| Library | Scenario | Op/ns | Alloc/op | Speedup |
-| :--- | :--- | :--- | :--- | :--- |
-| **Weir** | **DDOS (Write-Heavy)** | **193 ns** | **106 B** | **1x (Baseline)** |
-| Ulule | Highload (Write-Heavy) | 397 ns | 228 B | 2x slower |
-| StdLib | Highload (Write-Heavy) | 2541 ns | 207 B | **13x slower** |
-| Juju | Highload (Write-Heavy) | 5984 ns | 186 B | **31x slower** |
-| | | | | |
-| **Weir** | **Stable (Read-Heavy)** | **185 ns** | **0 B** | **1x (Baseline)** |
-| Ulule | Stable (Read-Heavy) | 536 ns | 39 B | 2.9x slower |
-| StdLib | Stable (Read-Heavy) | 181 ns | 0 B | ~Same |
-| Juju | Stable (Read-Heavy) | 182 ns | 0 B | ~Same |
+| Library | ns/op | bytes/op | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Weir** | **308.6 ns** | **0 B** | **1x** |
+| Ulule | 569.9 ns | 63 B | 1.8x slower |
+| StdLib | 1673 ns | 9 B | **5.3x slower** |
+| Juju | 2009 ns | 11 B | **6.3x slower** |
 
+### Scenario 2: Stable Highload (Read-Heavy)
+*Simulates 100,000 active users with a warm cache. Measures standard operation latency.*
+
+| Library | Op/ns | Alloc/op | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Weir** | **182 ns** | **0 B** | **1x** |
+| StdLib | 183 ns | 0 B | ~Same |
+| Juju | 184 ns | 0 B | ~Same |
+| Ulule | 561 ns | 56 B | 3x slower |
 
 ## 📦 Installation
 
@@ -89,10 +87,9 @@ func main() {
 	}
 
 	userID := "user-123"
-	cost := int64(1)
 
 	// Check if request is allowed
-	if limiter.Allow(userID, cost) {
+	if limiter.Allow(userID, 1) {
 		fmt.Println("Allowed!")
 	} else {
 		fmt.Println("Rate limit exceeded (429)")
@@ -103,102 +100,61 @@ func main() {
 
 ## 🌐 Middleware Integrations
 
-Weir is easy to integrate with popular Go web frameworks.
+Weir is designed to be dependency-free. Integrating Weir is easy—just copy the recipe for your framework.
 
 ### Fiber
 
 ```go
-import (
-    "time"
-    "context"
-    "github.com/gofiber/fiber/v2"
-    "github.com/GrygorenkoMykhailo/weir"
-    // Alias used to avoid conflict with "fiber" package
-    weirmw "github.com/GrygorenkoMykhailo/weir/middlewares/fiber"
-)
+// Add this middleware to your Fiber app
+app.Use(func(c *fiber.Ctx) error {
+    // 1. Identify the user (e.g., by IP or API Key)
+    key := c.IP()
 
-// ...
+    // 2. Check the limit (cost = 1)
+    if !limiter.Allow(key, 1) {
+        // 3. Return 429 if limit exceeded
+        return c.Status(fiber.StatusTooManyRequests).SendString("Too Many Requests")
+    }
 
-// Create Limiter Instance
-limiter, _ := weir.New(context.Background(), weir.RateLimiterOptions{
-    Rate: time.Second / 100, Burst: 20, Shards: 1024,
-    KeyTTL: time.Minute, CleanupRate: time.Minute,
-})
-
-app.Use(weirmw.Middleware(1, func(c *fiber.Ctx) error {
+    // 4. Continue
     return c.Next()
-}, &weirmw.FiberMiddlewareOptions{
-    Limiter: limiter,
-    KeyExtractor: func(c *fiber.Ctx) string {
-        return c.IP()
-    },
-    OnTooManyRequests: func(c *fiber.Ctx) error {
-        return c.Status(429).SendString("Too Many Requests")
-    },
-}))
+})
 ```
 
 ### Gin
 
 ```go
-import (
-    "time"
-    "context"
-    "github.com/gin-gonic/gin"
-    "github.com/GrygorenkoMykhailo/weir"
-    // Alias used to avoid conflict with "gin" package
-    weirmw "github.com/GrygorenkoMykhailo/weir/middlewares/gin"
-)
+// Add this middleware to your Gin router
+r.Use(func(c *gin.Context) {
+    key := c.ClientIP()
 
-// ...
+    if !limiter.Allow(key, 1) {
+        c.AbortWithStatusJSON(429, gin.H{"error": "Too Many Requests"})
+        return
+    }
 
-// Create Limiter Instance
-limiter, _ := weir.New(context.Background(), weir.RateLimiterOptions{
-    Rate: time.Second / 100, Burst: 20, Shards: 1024,
-    KeyTTL: time.Minute, CleanupRate: time.Minute,
-})
-
-r.Use(weirmw.Middleware(1, func(c *gin.Context) {
     c.Next()
-}, &weirmw.GinMiddlewareOptions{
-    Limiter: limiter,
-    KeyExtractor: func(c *gin.Context) string {
-        return c.ClientIP()
-    },
-    OnTooManyRequests: func(c *gin.Context) {
-        c.AbortWithStatus(429)
-    },
-}))
+})
 ```
 
 ### StdLib (`net/http`)
 
 ```go
-import (
-    "time"
-    "context"
-    "net/http"
-    "github.com/GrygorenkoMykhailo/weir"
-    "github.com/GrygorenkoMykhailo/weir/middlewares/stdlib"
-)
+func RateLimitMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        key := r.RemoteAddr // Or extract from headers
 
-// ...
+        if !limiter.Allow(key, 1) {
+            http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+            return
+        }
 
-// Create Limiter Instance
-limiter, _ := weir.New(context.Background(), weir.RateLimiterOptions{
-    Rate: time.Second / 100, Burst: 20, Shards: 1024,
-    KeyTTL: time.Minute, CleanupRate: time.Minute,
-})
+        next.ServeHTTP(w, r)
+    })
+}
 
-http.HandleFunc("/", stdlib.Middleware(1, myHandler, &stdlib.StdLibMiddlewareOptions{
-    Limiter: limiter,
-    KeyExtractor: func(r *http.Request) string {
-        return r.RemoteAddr
-    },
-    OnTooManyRequests: func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(429)
-    },
-}))
+// Usage:
+// http.Handle("/", RateLimitMiddleware(myHandler))
 ```
 
 
@@ -208,8 +164,8 @@ http.HandleFunc("/", stdlib.Middleware(1, myHandler, &stdlib.StdLibMiddlewareOpt
 | :--- | :--- | :--- |
 | `Rate` | Duration to regenerate **one** token. (e.g. `time.Second / 1000` = 1000 RPS). | `time.Second / RPS` |
 | `Burst` | Maximum capacity of the bucket (max burst size). | Based on your load |
-| `Shards` | Number of internal map shards. Reduces lock contention. **Should be a power of two**. | `512` - `4096` |
-| `KeyTTL` | Idle duration after which a user key is removed. | `1m` - `10m` |
+| `Shards` | Number of internal map shards. Reduces lock contention. | `512` - `4096` |
+| `KeyTTL` | Idle duration after which a key is considered expired. | `1m` - `10m` |
 | `CleanupRate` | How often the background janitor scans all shards. | `1m` |
 
 

@@ -8,7 +8,7 @@ import (
 
 func TestShardLazyInitAndConcurrency(t *testing.T) {
 	s := &shard{
-		buckets: make(map[uint64]bucket),
+		buckets: make(map[uint64]*bucket),
 	}
 
 	key := uint64(1)

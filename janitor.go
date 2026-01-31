@@ -11,9 +11,8 @@ func janitor(ctx context.Context, l *Limiter) {
 
 	tickInterval := l.Config.CleanupRate / time.Duration(l.Config.Shards)
 	batchSize := 1
-
 	if tickInterval < minimalInterval {
-		batchSize = int(minimalInterval / tickInterval)
+		batchSize = int(minimalInterval/tickInterval) + 1
 		tickInterval = minimalInterval
 	}
 
@@ -23,6 +22,7 @@ func janitor(ctx context.Context, l *Limiter) {
 	shardIdx := uint64(0)
 	mask := l.Config.shards - 1
 	keyTTL := l.Config.KeyTTL.Nanoseconds()
+	keysToDelete := make([]uint64, 0, processLimit)
 
 	for {
 		select {
@@ -36,31 +36,44 @@ func janitor(ctx context.Context, l *Limiter) {
 					shard := &l.shards[(shardIdx+1)&mask]
 					shardIdx++
 
-					for {
-						processed := 0
-						cleared := 0
+					keysToDelete = keysToDelete[:0]
+					processed := 0
 
-						shard.mu.Lock()
-						now := time.Now().UnixNano()
+					shard.mu.RLock()
+					now := time.Now().UnixNano()
 
-						for k, b := range shard.buckets {
+					for k, b := range shard.buckets {
+						b.mu.Lock()
 
-							if now-b.lastCalled > keyTTL {
-								delete(shard.buckets, k)
-								cleared++
-							}
-							processed++
-
-							if processed >= processLimit {
-								break
-							}
+						if now-b.lastCalled > keyTTL {
+							keysToDelete = append(keysToDelete, k)
 						}
+						b.mu.Unlock()
 
-						shard.mu.Unlock()
-
-						if processed < processLimit || cleared < (processLimit/4) {
+						processed++
+						if processed >= processLimit {
 							break
 						}
+					}
+					shard.mu.RUnlock()
+
+					if len(keysToDelete) > 0 {
+						shard.mu.Lock()
+						for _, k := range keysToDelete {
+							b, ok := shard.buckets[k]
+							if !ok {
+								continue
+							}
+
+							b.mu.Lock()
+							stillExpired := now-b.lastCalled > keyTTL
+							b.mu.Unlock()
+
+							if stillExpired {
+								delete(shard.buckets, k)
+							}
+						}
+						shard.mu.Unlock()
 					}
 				}
 			}
